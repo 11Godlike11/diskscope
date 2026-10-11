@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible DiskScope issue without uploading private disk data.
+body:
+  - type: markdown
+    attributes:
+      value: "For a security issue, use private vulnerability reporting. Do not attach raw snapshots, cleanup tokens, or full path inventories."
+  - type: input
+    id: version
+    attributes:
+      label: DiskScope version and Windows version
+      placeholder: "DiskScope 1.0.0, Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: "Command or MCP tool, filesystem, minimal fixture, expected result, actual result. Redact private filenames."
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Redacted error or status

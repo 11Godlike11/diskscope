@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+artifacts/
+data/
+*.dscope
+*.execution.jsonl
+*.tmp
+.venv/
+__pycache__/
+*.user
+.DS_Store
