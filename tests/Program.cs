@@ -127,6 +127,75 @@ static class Tests
         Check(!Snapshot.FormatCurrent(old), "v2 snapshots are marked noncurrent");
         Throws<InvalidDataException>(() => Snapshot.Load(old), "disk_scan", "v2 load reports a clear rescan requirement");
     }
+    static void TestAgentOutput(string root)
+    {
+        var s = new Snapshot { Root = @"C:\", RootId = 1, CreatedUtc = DateTime.UtcNow };
+        var b = new IndexBuilder();
+        foreach (var e in new Entry[] {
+            new() { Id = 1, Directory = true },
+            new() { Id = 2, Directory = true, Names = [new(1, "dir", 1)] },
+            new() { Id = 3, Allocated = 4 * 1024 * 1024, Logical = 4 * 1024 * 1024, Names = [new(2, "movie.MP4", 1), new(1, "z-alias.mp4", 1)] },
+            new() { Id = 4, Allocated = 2 * 1024 * 1024, Logical = 128 * 1024 * 1024, Names = [new(2, "sparse.img", 1)] },
+            new() { Id = 5, Allocated = 1024 * 1024, Logical = 2 * 1024 * 1024, Names = [new(2, "README", 1)] },
+            new() { Id = 6, Allocated = 1024 * 1024, Logical = 1024 * 1024, Reparse = true, Names = [new(2, "link.png", 1)] },
+            new() { Id = 7, Allocated = 16 * 1024 * 1024, Logical = 17 * 1024 * 1024 + 1, Names = [new(2, "lowdiff.cs", 1)] },
+            new() { Id = 8, Allocated = 1024 * 1024, Logical = 1024 * 1024, Names = [new(2, "cache.tmp", 1)] },
+            new() { Id = 9, Allocated = 2 * 1024 * 1024, Logical = 2 * 1024 * 1024, Names = [new(2, "small.mp4", 1)] } }) b.Add(e);
+        s.Build([b]);
+        string cache = Path.Combine(root, "agent-state"); Directory.CreateDirectory(cache); string file = Path.Combine(cache, "C.dscope"); s.Save(file);
+        using (var fs = File.OpenRead(file)) using (var r = new BinaryReader(fs)) Check(r.ReadString() == Snapshot.Magic && r.ReadByte() == 1, "Default atomic v3 snapshot uses ZLib flag");
+        Check(Snapshot.Load(file).Get(1).TotalAllocated == s.Get(1).TotalAllocated && !Directory.EnumerateFiles(cache, "*.tmp").Any(), "Default ZLib roundtrip and atomic temporary cleanup");
+        using var service = new Service(cache);
+        var browse = JsonSerializer.SerializeToElement(service.Browse(@"C:\dir", 20, 0, "name"), Program.JsonOptions);
+        var rows = browse.GetProperty("items").EnumerateArray().ToDictionary(x => x.GetProperty("name").GetString()!);
+        Check(browse.TryGetProperty("snapshot", out var stamp) && !browse.TryGetProperty("scan", out _) && stamp.EnumerateObject().Count() == 3 && !browse.TryGetProperty("next_action", out _) && !browse.TryGetProperty("next_offset", out _), "Compact response has short snapshot and no generic guidance");
+        var normal = rows["small.mp4"];
+        Check(normal.EnumerateObject().Count() == 6 && !normal.TryGetProperty("files", out _) && !normal.TryGetProperty("id", out _) && !normal.TryGetProperty("cleanup_hint", out _), "Ordinary compact file contains only six required fields");
+        Check(rows["sparse.img"].GetProperty("logical_bytes").GetInt64() == 128 * 1024 * 1024 && !rows["README"].TryGetProperty("logical_bytes", out _) && !rows["lowdiff.cs"].TryGetProperty("logical_bytes", out _), "Logical size requires both strict 1 MiB and 10 percent differences");
+        Check(rows["movie.MP4"].GetProperty("hard_links").GetInt32() == 2 && !normal.TryGetProperty("hard_links", out _) && rows["link.png"].GetProperty("reparse_point").GetBoolean() && !normal.TryGetProperty("reparse_point", out _), "Nondefault hard-link and reparse flags are conditional");
+        Check(rows["movie.MP4"].GetProperty("cleanup_hint").GetString()!.StartsWith("hard-linked") && browse.GetProperty("directory").GetProperty("files").GetInt64() == 7 && browse.GetProperty("directory").GetProperty("expandable").GetBoolean(), "Special cleanup hint and directory-only counts are preserved");
+        Check(normal.GetProperty("share").GetDouble() == 7.4 && Service.Share(1, 3) == 33.3 && Service.Share(1, 0) == 0, "Shares use parent allocation, one decimal and zero-safe division");
+        var alias = JsonSerializer.SerializeToElement(service.Browse(@"C:\", 20, 0, "name"), Program.JsonOptions).GetProperty("items")[1];
+        Check(alias.GetProperty("hard_link_alias").GetBoolean() && alias.GetProperty("allocated_bytes").GetInt64() == 0 && alias.GetProperty("physical_bytes").GetInt64() == 4 * 1024 * 1024 && alias.GetProperty("canonical_path").GetString() == @"C:\dir\movie.MP4", "Compact alias exposes physical bytes and canonical owner without duplicate allocation");
+        var full = JsonSerializer.SerializeToElement(service.Browse(@"C:\dir", 20, 0, "name", true), Program.JsonOptions);
+        var fullRow = full.GetProperty("items")[0];
+        Check(full.TryGetProperty("scan", out var info) && info.TryGetProperty("accounting", out _) && !full.TryGetProperty("snapshot", out _) && fullRow.TryGetProperty("id", out _) && fullRow.TryGetProperty("logical", out _) && fullRow.TryGetProperty("child_count", out _) && fullRow.TryGetProperty("hard_link_alias", out _) && full.TryGetProperty("next_action", out _), "Verbose retains full 1.0.x browse fields and guidance");
+        var detail = JsonSerializer.SerializeToElement(service.Detail(@"C:\dir\small.mp4", true), Program.JsonOptions);
+        Check(detail.TryGetProperty("scan", out _) && detail.TryGetProperty("note", out _) && detail.GetProperty("item").TryGetProperty("logical_bytes", out _), "Verbose detail retains compatibility metadata");
+        var largest = JsonSerializer.SerializeToElement(service.Largest(@"C:\dir", 1, 0, null, null, true), Program.JsonOptions);
+        Check(largest.TryGetProperty("scan", out _) && largest.GetProperty("items")[0].TryGetProperty("id", out _), "Verbose largest retains compatibility fields");
+        var types = JsonSerializer.SerializeToElement(service.Types(@"C:\", 50), Program.JsonOptions);
+        var ext = types.GetProperty("extensions").EnumerateArray().ToDictionary(x => x.GetProperty("extension").GetString()!);
+        Check(types.GetProperty("files").GetInt64() == 7 && ext[".mp4"].GetProperty("files").GetInt64() == 2 && ext[".mp4"].GetProperty("allocated_bytes").GetInt64() == 6 * 1024 * 1024, "Types merges extension case and counts canonical hard links once");
+        Check(ext["(no extension)"].GetProperty("files").GetInt64() == 1 && ext[".mp4"].GetProperty("example_path").GetString() == @"C:\dir\movie.MP4" && ext[".mp4"].GetProperty("share").GetDouble() == 22.2, "Types includes no extension, largest example and subtree share");
+        Check(types.GetProperty("categories").EnumerateArray().Select(x => x.GetProperty("category").GetString()).Order().SequenceEqual(new[] { "code", "disk_image", "image", "other", "temp_cache", "video" }.Order()) && types.GetProperty("categories").EnumerateArray().Sum(x => x.GetProperty("allocated_bytes").GetInt64()) == s.Get(1).TotalAllocated, "Types category totals preserve physical allocation");
+        foreach (var mapping in new[] { (".mp3", "audio"), (".zip", "archive"), (".msi", "installer"), (".pdf", "document"), (".db", "database"), (".log", "log"), (".dll", "executable/library"), (".unknown", "other"), (".ts", "code") })
+            Check(FileTypes.Category(mapping.Item1) == mapping.Item2, $"Category mapping {mapping.Item1}");
+        Check(Field<object[]>(service.Types(@"C:\", 1), "extensions").Length == 1 && Field<object[]>(service.Types(@"C:\dir\small.mp4"), "extensions").Length == 1, "Types limits output and supports file scope");
+        Check(JsonSerializer.SerializeToElement(service.Types(@"C:\", verbose: true), Program.JsonOptions).TryGetProperty("scan", out _), "Types supports verbose snapshot metadata");
+    }
+    static void TestWait()
+    {
+        var jobs = new Jobs(); using var finish = new ManualResetEventSlim();
+        var started = jobs.Start("test", update => { update(new("waiting", 1, 2)); finish.Wait(); return new { ok = true }; });
+        string id = Field<string>(started, "job_id");
+        var zero = Stopwatch.StartNew(); Check(Field<string>(jobs.WaitStatus(id, 0).GetAwaiter().GetResult(), "state") == "running" && zero.Elapsed.TotalSeconds < .5, "Zero wait returns immediately");
+        var progress = new List<CleanupProgress>(); var watch = Stopwatch.StartNew(); var wait = jobs.WaitStatus(id, 30, progress.Add);
+        Thread.Sleep(1100); finish.Set();
+        Check(Field<string>(wait.GetAwaiter().GetResult(), "state") == "complete" && watch.Elapsed.TotalSeconds < 3 && progress.Count >= 1 && progress.Any(p => p.Processed == 1), "Waiting emits task progress and completes early");
+        watch.Restart(); jobs.WaitStatus(id, 30).GetAwaiter().GetResult(); Check(watch.Elapsed.TotalSeconds < .5, "Completed jobs do not consume requested wait");
+        Throws<ArgumentException>(() => jobs.WaitStatus(id, 31).GetAwaiter().GetResult(), "0..30", "Wait upper bound enforced");
+        Throws<ArgumentException>(() => jobs.WaitStatus(id, -1).GetAwaiter().GetResult(), "0..30", "Wait lower bound enforced");
+        Throws<ArgumentException>(() => jobs.WaitStatus("missing", 1).GetAwaiter().GetResult(), "Unknown job_id", "Unknown waiting job rejected");
+        using var blocked = new ManualResetEventSlim(); var next = jobs.Start("timeout", _ => { blocked.Wait(); return new { }; });
+        watch.Restart(); var timed = jobs.WaitStatus(Field<string>(next, "job_id"), 1).GetAwaiter().GetResult();
+        Check(Field<string>(timed, "state") == "running" && watch.Elapsed.TotalSeconds >= .9 && watch.Elapsed.TotalSeconds < 2, "Wait timeout returns still-running state");
+        blocked.Set(); jobs.Drain();
+        var views = jobs.Start("views", _ => new JobResult(new { value = "compact" }, new { value = "full" })); jobs.Drain();
+        string viewsId = Field<string>(views, "job_id");
+        Check(Field<JsonElement>(jobs.Status(viewsId), "result").GetProperty("value").GetString() == "compact" && Field<JsonElement>(jobs.Status(viewsId, true), "result").GetProperty("value").GetString() == "full", "Job status selects compact or full stored results without retaining an index");
+        Check(Field<JsonElement>(jobs.WaitStatus(viewsId, 30, verbose: true).GetAwaiter().GetResult(), "result").GetProperty("value").GetString() == "full", "Waiting job status honors verbose result selection");
+    }
     static void TestCleanupAdjustment(string root)
     {
         string fixture = Path.Combine(root, "adjust"); Directory.CreateDirectory(fixture);
@@ -178,7 +247,7 @@ static class Tests
         string root = Path.GetFullPath(args[0]);
         if (Directory.Exists(root) || File.Exists(root)) throw new InvalidOperationException("Test directory already exists; choose a new fixture path");
         Directory.CreateDirectory(root);
-        TestFixup(); TestBitmap(); TestCompact(root); TestCleanupAdjustment(root);
+        TestFixup(); TestBitmap(); TestCompact(root); TestAgentOutput(root); TestWait(); TestCleanupAdjustment(root);
         string cache = Path.Combine(root, "state"); using var service = new Service(cache); var cleaner = new Cleanup(service);
         string fixture = Path.Combine(root, "fixture"); Directory.CreateDirectory(fixture);
         string regular = Path.Combine(fixture, "大 文件.dat"); File.WriteAllBytes(regular, new byte[1048577]);

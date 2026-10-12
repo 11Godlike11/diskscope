@@ -48,14 +48,20 @@ DiskScope 是专门给 AI 使用的 Windows 磁盘分析和清理工具。它读
 查看盘符 → 扫描并查询进度 → 展开一层 → 查局部大文件 → 清理预览 → 审阅并授权 → 执行 → 核对释放空间。
 
 - `disk_scan`、`disk_cleanup_plan` 和 `disk_cleanup_execute` 立即返回任务编号。
-- 用 `disk_job_status` 查询阶段、计数和结果。预览完成后才会得到 `plan_id` 和 `confirm_token`。
+- 用 `disk_job_status` 的 `wait_seconds: 30` 等待阶段、计数和结果，完成时立即返回，避免快速轮询。预览完成后才会得到 `plan_id` 和 `confirm_token`。
 - 查询结果最多 100 项，默认 20 项；有更多内容时使用分页或继续展开指定目录。
 - 默认只保留一个卷的内存索引，空闲两分钟后释放；`disk_release` 可立即卸载，磁盘上的索引仍保留。
 - Windows 的系统文件缓存由系统管理，DiskScope 不会自动清空系统缓存或修改其他程序的内存。
 
 常驻索引使用紧凑记录数组、去重 UTF-16 名称池、CSR 子节点表和仅目录保留的合计。扫描先通过 MFT 位图跳过空槽，两个读线程与多线程解析重叠；位图不可用时回退到全量读取。构建期间仍有临时内存开销。
 
-v3 快照默认不压缩，各数组整块读写，以更大的磁盘文件换取更快加载。旧 v1/v2 快照需要重新 `disk_scan`，`disk_volumes.snapshot_format_current` 会标明格式是否可用。扫描信息新增 `timings`、`total_record_slots` 和 `bitmap_used`；`raw_records` 表示实际读取/枚举的槽数，包含合并读取段中的小空洞。读盘和解析重叠，阶段计时不能相加当作总扫描时间。参见 [性能测量与取舍](docs/PERFORMANCE.md)。
+v3 快照各数组整块读写，默认使用 ZLib Fastest 压缩，缩小索引文件；继续兼容未压缩 v3。旧 v1/v2 快照需要重新 `disk_scan`，`disk_volumes.snapshot_format_current` 会标明格式是否可用。扫描信息新增 `timings`、`total_record_slots` 和 `bitmap_used`；`raw_records` 表示实际读取/枚举的槽数，包含合并读取段中的小空洞。读盘和解析重叠，阶段计时不能相加当作总扫描时间。参见 [性能测量与取舍](docs/PERFORMANCE.md)。
+
+默认输出精简行：名称、路径、类型、实际字节数、可读大小和占父目录的百分比；目录额外提供文件数和是否可展开。逻辑大小明显异常、硬链接、重解析点、别名和特殊清理提示只在有意义时出现。查询响应提供简短的快照时间与年龄；CLI `--verbose` 或 MCP `verbose: true` 恢复 1.0.x 完整字段。所有返回数据的工具接受该选项，清理安全字段继续完整保留。
+
+`disk_types` / CLI `types` 汇总子树中的扩展名和大类，返回实际占用、文件数、占比和每种扩展名的最大文件示例，默认 15 种、最多 50 种。硬链接仅按 canonical 计一次，不跟随目录连接；分类仅基于扩展名，不代表可删除。只读模式可用。
+
+MCP 共 13 个工具，只读模式提供 9 个。带等待的状态请求不会阻塞 ping、工具列表或其他状态请求；在 `params._meta.progressToken` 提供字符串或整数可接收进度通知。stdin 正常关闭时会等已接受任务及等待响应收尾。
 
 详细工具参数见 [MCP.md](docs/MCP.md)。
 
@@ -67,6 +73,8 @@ AI 不支持 MCP 时，可以调用 EXE 并解析返回的 JSON：
 .\DiskScope.exe volumes
 .\DiskScope.exe scan F:
 .\DiskScope.exe browse 'F:\' --limit 10
+.\DiskScope.exe types 'F:\Downloads' --limit 15
+.\DiskScope.exe browse 'F:\' --limit 20 --verbose
 .\DiskScope.exe largest 'F:\Downloads' --extension zip --min-bytes 104857600 --limit 10
 .\DiskScope.exe plan 'F:\明确可丢弃的缓存目录'
 .\DiskScope.exe plan-show PLAN_ID

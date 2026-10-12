@@ -11,7 +11,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <Description>Progressive NTFS disk analysis and guarded cleanup for AI agents.</Description>
     <Authors>11Godlike11</Authors>
     <RepositoryUrl>https://github.com/11Godlike11/diskscope</RepositoryUrl>

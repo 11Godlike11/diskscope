@@ -21,7 +21,7 @@ It ships as a self-contained executable with a JSON CLI and a standard **stdio M
 - **Physical allocation accounting:** distinguish sparse logical sizes and count hard-linked storage once.
 - **Metadata scans:** skip empty MFT ranges using its bitmap, overlap bounded reads and parsing, and repair fixed 512-byte update sequences on both 512-byte and 4K native-sector volumes. Full reads and NTFS control codes remain fallbacks.
 - **Reviewed cleanup:** preview an exact file set, check current identity and metadata, then delete only that set.
-- **Background MCP jobs:** scans, cleanup previews, and deletion return a job ID immediately; poll progress through completion.
+- **Background MCP jobs:** scans, cleanup previews, and deletion return a job ID immediately; wait for progress/completion without rapid polling.
 - **Bounded resident indexes:** cache one volume, release idle indexes after 120 seconds, or explicitly call `disk_release`.
 - **Local operation:** no uploads, telemetry, network listener, or file-content analysis.
 
@@ -68,7 +68,7 @@ Remove `--read-only` to expose cleanup tools. This flag disables cleanup; analys
 
 ### Ask your agent
 
-> Use DiskScope to inspect F: by allocated size. Start with volumes, scan if the snapshot is missing or stale, and expand at most 10 items per directory. Identify the owner and purpose of large files. Preserve source code, assets, game saves, and service data. Preview specific cleanup candidates and delete only the scope I authorize. Poll every background job to completion, rescan after deletion, and finish with disk_release.
+> Use DiskScope to inspect F: by allocated size. Start with volumes, scan if the snapshot is missing or stale, and expand at most 10 items per directory. Identify the owner and purpose of large files. Preserve source code, assets, game saves, and service data. Preview specific cleanup candidates and delete only the scope I authorize. Use disk_job_status with wait_seconds: 30 for every background job through completion, rescan after deletion, and finish with disk_release.
 
 ## JSON CLI
 
@@ -77,10 +77,16 @@ Remove `--read-only` to expose cleanup tools. This flag disables cleanup; analys
 .\DiskScope.exe scan F:
 .\DiskScope.exe browse 'F:\' --limit 10
 .\DiskScope.exe largest 'F:\Downloads' --extension zip --min-bytes 104857600 --limit 10
+.\DiskScope.exe types 'F:\Downloads' --limit 15
+.\DiskScope.exe browse 'F:\' --limit 20 --verbose
 .\DiskScope.exe detail 'F:\Downloads\old-package.zip'
 ```
 
 CLI scans and cleanup are synchronous. Standard output contains one JSON result; diagnostics go to stderr. Error results have a nonzero exit code. The CLI also works for agents that can run commands but do not support MCP.
+
+Queries default to compact rows: name/path/kind, allocated bytes and readable size, and percentage of parent allocation. Directories add files/expandable; unusual logical sizes, hard links, reparse points, aliases and ownership hints appear only when relevant. Query responses include a short snapshot timestamp/age. Use CLI `--verbose` or MCP `verbose: true` for the complete 1.0.x fields. All data tools accept this option; unchanged safety/cleanup payloads retain their fields.
+
+`types` / `disk_types` summarizes extensions (default 15, maximum 50) and broad categories in an indexed subtree, with file counts, allocated sizes, shares and the largest example per extension. It counts canonical hard links once and is available in analysis-only mode. Categories are filename hints and do not establish safe deletion.
 
 Cleanup uses three separate calls:
 
@@ -102,13 +108,13 @@ Cleanup uses three separate calls:
 
 The MCP server keeps at most one loaded volume index and evicts it after the idle timeout. `disk_release` unloads it immediately while retaining the snapshot on disk. Configure `--idle-seconds 30` for a shorter idle window.
 
-The resident index uses packed records, shared UTF-16 names, CSR children, and totals stored only for directories. v3 snapshots use contiguous uncompressed arrays for bulk loading; they are larger on disk than v2 compressed snapshots. v1/v2 snapshots must be recreated with `disk_scan`; `disk_volumes.snapshot_format_current` identifies usable formats. Scan info reports read/parse/build/save timings and distinguishes actually read `raw_records` from `total_record_slots`. [Measurements and tradeoffs](docs/PERFORMANCE.md).
+The resident index uses packed records, shared UTF-16 names, CSR children, and totals stored only for directories. v3 snapshots use contiguous arrays with ZLib Fastest compression by default; uncompressed v3 files remain readable. v1/v2 snapshots must be recreated with `disk_scan`; `disk_volumes.snapshot_format_current` identifies usable formats. Scan info reports read/parse/build/save timings and distinguishes actually read `raw_records` from `total_record_slots`. [Measurements and tradeoffs](docs/PERFORMANCE.md).
 
 Large scans still need memory proportional to the volume's file count, including temporary construction buffers. Windows may also grow its own filesystem cache during heavy metadata I/O. Releasing DiskScope's index does **not** flush the system cache or change other programs. DiskScope does not install services or apply global memory limits.
 
 After cleanup, a matching loaded index removes the successfully deleted names, keeps hard-linked allocation until the final name is removed, and saves the adjusted snapshot. Scan info reports `adjusted_after_cleanup` and `cleanup_adjustments`. If the index is unloaded, replaced, or no longer matches the planned identity/link count, the result's existing `next_action` asks for a rescan. Incremental adjustment does not track unrelated live changes; rescan for a fresh volume-wide view.
 
-MCP scan, preview, and execute calls return `job_id`. Use `disk_job_status` until `complete` or `failed`, and keep the server alive. After a timeout, inspect the running job or durable audit rather than replaying deletion. [Job workflow](docs/MCP.md#background-jobs).
+MCP scan, preview, and execute calls return `job_id`. Use `disk_job_status` with `wait_seconds: 30` until `complete` or `failed`, and keep the server alive. Waits return as soon as the job finishes, leave ping/tool discovery responsive, and can report MCP progress when `params._meta.progressToken` is supplied. There are 13 tools, or 9 in analysis-only mode. After a timeout, inspect the running job or durable audit rather than replaying deletion. [Job workflow](docs/MCP.md#background-jobs).
 
 ## Build and contribute
 

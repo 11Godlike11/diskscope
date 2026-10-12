@@ -118,14 +118,22 @@ sealed class Service : IDisposable
         snapshot_exists = File.Exists(SnapshotFile(d.Name)),
         snapshot_written_utc = File.Exists(SnapshotFile(d.Name)) ? (DateTime?)File.GetLastWriteTimeUtc(SnapshotFile(d.Name)) : null,
         snapshot_format_current = File.Exists(SnapshotFile(d.Name)) && Snapshot.FormatCurrent(SnapshotFile(d.Name)),
+        scan = VolumeInfo(d.Name),
         fast_scan_available = d.DriveFormat == "NTFS"
     }).ToArray();
-    public object Scan(string path, Action<long,long>? progress = null)
+    object? VolumeInfo(string root)
+    {
+        string file = SnapshotFile(root);
+        try { return File.Exists(file) && Snapshot.FormatCurrent(file) ? Info(Snapshot.Metadata(file)) : null; }
+        catch (IOException) { return null; }
+    }
+    public object Scan(string path, Action<long,long>? progress = null, bool verbose = false, bool both = false)
     {
         Release();
         var s = NtfsScanner.Scan(Normalize(path), progress); Directory.CreateDirectory(DataDir);
         s.Save(SnapshotFile(s.Root)); Remember(s);
-        return new { scan = Info(s), overview = Browse(s.Root, 20, 0, "allocated") };
+        var info = Info(s); var result = new { scan = info, overview = Browse(s.Root, 20, 0, "allocated", verbose) };
+        return both ? new JobResult(result, new { scan = info, overview = Browse(s.Root, 20, 0, "allocated", true) }) : result;
     }
     object Info(Snapshot s) => new
     {
@@ -136,7 +144,7 @@ sealed class Service : IDisposable
         adjusted_after_cleanup = s.AdjustedAfterCleanup, cleanup_adjustments = s.CleanupAdjustments,
         live_snapshot = false, accounting = "Physical extents counted once per MFT record; hard links have one canonical owner. Includes ADS and nonresident metadata. Live volume can change while scanning."
     };
-    object Row(Snapshot s, IndexedEntry e, string? displayedPath = null, bool alias = false) => new
+    object FullRow(Snapshot s, IndexedEntry e, string? displayedPath = null, bool alias = false) => new
     {
         id = e.Id.ToString("x16"), name = e.Id == s.RootId ? s.Root : displayedPath == null ? e.Name : System.IO.Path.GetFileName(displayedPath.TrimEnd('\\')), path = displayedPath ?? s.PathOf(e.Id),
         kind = e.Directory ? "directory" : "file", allocated_bytes = alias ? 0 : e.TotalAllocated, allocated = Human(alias ? 0 : e.TotalAllocated),
@@ -145,6 +153,29 @@ sealed class Service : IDisposable
         hard_link_alias = alias, canonical_path = alias ? s.PathOf(e.Id) : null, physical_bytes = alias ? (long?)e.TotalAllocated : null,
         cleanup_hint = Hint(displayedPath ?? s.PathOf(e.Id), e)
     };
+    internal static double Share(long bytes, long total) => total <= 0 ? 0 : Math.Round(100d * bytes / total, 1);
+    object Stamp(Snapshot s) => new { root = s.Root, scanned_utc = s.CreatedUtc, age_minutes = Math.Round(Math.Max(0, (DateTime.UtcNow - s.CreatedUtc).TotalMinutes), 1) };
+    Dictionary<string, object?> Response(Snapshot s, bool verbose) => new() { [verbose ? "scan" : "snapshot"] = verbose ? Info(s) : Stamp(s) };
+    internal object Row(Snapshot s, IndexedEntry e, string? displayedPath = null, bool alias = false, bool verbose = false)
+    {
+        if (verbose) return FullRow(s, e, displayedPath, alias);
+        string path = displayedPath ?? s.PathOf(e.Id); long allocated = alias ? 0 : e.TotalAllocated;
+        int parent = s.Nodes[e.Index].Parent;
+        long parentBytes = parent < 0 ? e.TotalAllocated : new IndexedEntry(s, parent).TotalAllocated;
+        var row = new Dictionary<string, object?> {
+            ["name"] = e.Id == s.RootId ? s.Root : displayedPath == null ? e.Name : System.IO.Path.GetFileName(path.TrimEnd('\\')),
+            ["path"] = path, ["kind"] = e.Directory ? "directory" : "file",
+            ["allocated_bytes"] = allocated, ["allocated"] = Human(allocated), ["share"] = Share(allocated, parentBytes)
+        };
+        if (e.Directory) { row["files"] = e.Files; row["expandable"] = e.ChildCount > 0; }
+        long difference = Math.Abs(e.TotalLogical - e.TotalAllocated);
+        if (difference > 1024 * 1024 && difference > e.TotalAllocated * .1) row["logical_bytes"] = e.TotalLogical;
+        if (e.Links > 1) row["hard_links"] = e.Links;
+        if (e.Reparse) row["reparse_point"] = true;
+        if (alias) { row["hard_link_alias"] = true; row["canonical_path"] = s.PathOf(e.Id); row["physical_bytes"] = e.TotalAllocated; }
+        string hint = Hint(path, e); if (hint != "review contents and ownership") row["cleanup_hint"] = hint;
+        return row;
+    }
     static string Hint(string path, IndexedEntry e)
     {
         if (e.Reparse) return "reparse-point: do not follow for cleanup";
@@ -161,7 +192,7 @@ sealed class Service : IDisposable
         "name" => entries.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase).ThenBy(e => e.Id),
         _ => throw new ArgumentException("sort must be allocated, logical or name")
     };
-    public object Browse(string path, int limit, int offset, string sort)
+    public object Browse(string path, int limit, int offset, string sort, bool verbose = false)
     {
         limit = Math.Clamp(limit, 1, 100); if (offset < 0) throw new ArgumentException("offset cannot be negative");
         path = Normalize(path); var s = Get(path); lock (s)
@@ -177,18 +208,19 @@ sealed class Service : IDisposable
                 _ => throw new ArgumentException("sort must be allocated, logical or name")
             }).ThenBy(x => x.Entry.Id).ToArray();
             var page = sorted.Skip(offset).Take(limit).ToArray(); int next = offset + page.Length;
-            return new
-            {
-                scan = Info(s), directory = Row(s, e, path), sort, offset, limit, total_children = sorted.Length,
-                items = page.Select(c => Row(s, c.Entry, System.IO.Path.Combine(path, c.Name), c.Alias)).ToArray(),
-                has_more = next < sorted.Length, next_offset = next < sorted.Length ? (int?)next : null,
-                omitted_children = Math.Max(0, sorted.Length - next),
-                omitted_allocated_bytes = sorted.Skip(next).Sum(c => c.Alias ? 0 : c.Entry.TotalAllocated),
-                next_action = "Expand an item.path with disk_browse; request further pages using next_offset. Do not infer deletability from size."
-            };
+            var response = Response(s, verbose);
+            response["directory"] = Row(s, e, path, verbose: verbose); response["sort"] = sort; response["offset"] = offset; response["limit"] = limit;
+            response["total_children"] = sorted.Length;
+            response["items"] = page.Select(c => Row(s, c.Entry, System.IO.Path.Combine(path, c.Name), c.Alias, verbose)).ToArray();
+            response["has_more"] = next < sorted.Length; if (next < sorted.Length) response["next_offset"] = next;
+            response["omitted_children"] = Math.Max(0, sorted.Length - next);
+            response["omitted_allocated_bytes"] = sorted.Skip(next).Sum(c => c.Alias ? 0 : c.Entry.TotalAllocated);
+            if (verbose) response["next_action"] = "Expand an item.path with disk_browse; request further pages using next_offset. Do not infer deletability from size.";
+            else if (next < sorted.Length) response["next_action"] = $"Continue with offset {next}.";
+            return response;
         }
     }
-    public object Detail(string path)
+    public object Detail(string path, bool verbose = false)
     {
         path = Normalize(path); var s = Get(path); lock (s)
         {
@@ -200,15 +232,41 @@ sealed class Service : IDisposable
                 live = new { exists = true, file_id = i.Identity.ToString("x16"), logical_bytes = i.Size, allocated_bytes = Native.Allocation(h), hard_links = i.Links, last_write_utc = DateTime.FromFileTimeUtc(i.Write), reparse_point = (i.Attributes & 0x400) != 0, matches_snapshot_identity = i.Identity == e.Id };
             }
             catch (Exception ex) { live = new { exists_or_accessible = false, error = ex.Message }; }
-            return new
-            {
-                scan = Info(s), item = Row(s, e, path), live,
-                hard_link_paths = e.Names.Count == 0 ? new[] { s.PathOf(e.Id) } : e.Names.Where(n => n.Namespace != 2).Select(n => s.Contains(n.Parent) ? System.IO.Path.Combine(s.PathOf(n.Parent), n.Name) : "[unresolved] " + n.Name).Distinct(StringComparer.OrdinalIgnoreCase).Take(100).ToArray(),
-                note = "Canonical directory totals count each physical record once. Aliases are available in detail/path lookup. Directory junction targets are not traversed. No file contents are read."
-            };
+            var response = Response(s, verbose);
+            bool alias = !path.TrimEnd('\\').Equals(s.PathOf(e.Id).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+            response["item"] = Row(s, e, path, !verbose && alias, verbose); response["live"] = live;
+            response["hard_link_paths"] = e.Names.Count == 0 ? new[] { s.PathOf(e.Id) } : e.Names.Where(n => n.Namespace != 2).Select(n => s.Contains(n.Parent) ? System.IO.Path.Combine(s.PathOf(n.Parent), n.Name) : "[unresolved] " + n.Name).Distinct(StringComparer.OrdinalIgnoreCase).Take(100).ToArray();
+            if (verbose) response["note"] = "Canonical directory totals count each physical record once. Aliases are available in detail/path lookup. Directory junction targets are not traversed. No file contents are read.";
+            return response;
         }
     }
-    public object Largest(string path, int limit, long minBytes, string? name, string? extension)
+    public object Types(string path, int limit = 15, bool verbose = false)
+    {
+        limit = Math.Clamp(limit, 1, 50); path = Normalize(path); var s = Get(path); lock (s)
+        {
+            var root = s.Get(s.Resolve(path)); long bytes = root.TotalAllocated;
+            var totals = FileTypes.Aggregate(s, root.Index);
+            var categories = new Dictionary<string, TypeTotal>();
+            var extensions = totals.Select(x => (Extension: x.Key.ToString(), Total: x.Value)).ToArray();
+            foreach (var x in extensions)
+            {
+                string category = FileTypes.Category(x.Extension);
+                if (!categories.TryGetValue(category, out var total)) categories.Add(category, total = new());
+                total.Allocated += x.Total.Allocated; total.Files += x.Total.Files;
+            }
+            var response = Response(s, verbose); response["scope"] = path; response["allocated_bytes"] = bytes;
+            response["files"] = extensions.Sum(x => x.Total.Files); response["total_extensions"] = totals.Count;
+            response["extensions"] = extensions.OrderByDescending(x => x.Total.Allocated).ThenBy(x => x.Extension, StringComparer.Ordinal).Take(limit).Select(x => new {
+                extension = x.Extension, allocated_bytes = x.Total.Allocated, allocated = Human(x.Total.Allocated), files = x.Total.Files,
+                share = Share(x.Total.Allocated, bytes), example_path = s.PathOf(s.Nodes[x.Total.Largest].Id)
+            }).ToArray();
+            response["categories"] = categories.OrderByDescending(x => x.Value.Allocated).ThenBy(x => x.Key, StringComparer.Ordinal).Select(x => new {
+                category = x.Key, allocated_bytes = x.Value.Allocated, allocated = Human(x.Value.Allocated), files = x.Value.Files, share = Share(x.Value.Allocated, bytes)
+            }).ToArray();
+            return response;
+        }
+    }
+    public object Largest(string path, int limit, long minBytes, string? name, string? extension, bool verbose = false)
     {
         limit = Math.Clamp(limit, 1, 100); path = Normalize(path); var s = Get(path); lock (s)
         {
@@ -221,7 +279,9 @@ sealed class Service : IDisposable
                 if (e.Allocated < minBytes || (name != null && !e.Name.Contains(name, StringComparison.OrdinalIgnoreCase)) || (extension != null && !System.IO.Path.GetExtension(e.Name).Equals(extension.StartsWith('.') ? extension : "." + extension, StringComparison.OrdinalIgnoreCase))) continue;
                 matches++; results.Enqueue(e, e.Allocated); if (results.Count > limit) results.Dequeue();
             }
-            return new { scan = Info(s), scope = path, matching_files = matches, returned = results.Count, items = results.UnorderedItems.Select(x => x.Element).OrderByDescending(e => e.Allocated).Select(e => Row(s, e)).ToArray() };
+            var response = Response(s, verbose); response["scope"] = path; response["matching_files"] = matches; response["returned"] = results.Count;
+            response["items"] = results.UnorderedItems.Select(x => x.Element).OrderByDescending(e => e.Allocated).Select(e => Row(s, e, verbose: verbose)).ToArray();
+            return response;
         }
     }
 }

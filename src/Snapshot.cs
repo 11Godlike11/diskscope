@@ -424,7 +424,7 @@ sealed class Snapshot
         if (count < 0 || (long)count * Unsafe.SizeOf<T>() > 2_000_000_000) throw new InvalidDataException("Invalid snapshot array length");
         var values = new T[count]; stream.ReadExactly(MemoryMarshal.AsBytes(values.AsSpan())); return values;
     }
-    public void Save(string file) => Save(file, 0);
+    public void Save(string file) => Save(file, 1);
     internal void Save(string file, byte codec)
     {
         var watch = Stopwatch.StartNew(); string temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -453,16 +453,25 @@ sealed class Snapshot
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
+    internal static Snapshot Metadata(string file)
+    {
+        using var fs = File.OpenRead(file); using var r = new BinaryReader(fs, Encoding.UTF8);
+        return ReadHeader(r, out _);
+    }
+    static Snapshot ReadHeader(BinaryReader r, out byte codec)
+    {
+        if (r.BaseStream.ReadByte() == 0x1f) throw new InvalidDataException("快照格式已过期，请重新 disk_scan"); r.BaseStream.Position = 0;
+        if (r.ReadString() != Magic) throw new InvalidDataException("快照格式已过期，请重新 disk_scan");
+        codec = r.ReadByte();
+        if (codec > 2) throw new InvalidDataException("Invalid snapshot codec");
+        return new Snapshot { Root = r.ReadString(), Backend = r.ReadString(), CreatedUtc = new(r.ReadInt64(), DateTimeKind.Utc), Seconds = r.ReadDouble(), RawRecords = r.ReadInt64(), InvalidRecords = r.ReadInt64(), RootId = r.ReadUInt64(), Unresolved = r.ReadInt64(),
+            TotalRecordSlots = r.ReadInt64(), BitmapUsed = r.ReadBoolean(), ReadSeconds = r.ReadDouble(), ParseSeconds = r.ReadDouble(), BuildSeconds = r.ReadDouble(), SaveSeconds = r.ReadDouble(), AdjustedAfterCleanup = r.ReadBoolean(), CleanupAdjustments = r.ReadInt32(), VolumeSerial = r.ReadUInt32(), Count = r.ReadInt32() };
+    }
     public static Snapshot Load(string file)
     {
         using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
         using var header = new BinaryReader(fs, Encoding.UTF8, true);
-        if (fs.ReadByte() == 0x1f) throw new InvalidDataException("快照格式已过期，请重新 disk_scan"); fs.Position = 0;
-        if (header.ReadString() != Magic) throw new InvalidDataException("快照格式已过期，请重新 disk_scan");
-        byte codec = header.ReadByte();
-        var r = header;
-        var s = new Snapshot { Root = r.ReadString(), Backend = r.ReadString(), CreatedUtc = new(r.ReadInt64(), DateTimeKind.Utc), Seconds = r.ReadDouble(), RawRecords = r.ReadInt64(), InvalidRecords = r.ReadInt64(), RootId = r.ReadUInt64(), Unresolved = r.ReadInt64(),
-            TotalRecordSlots = r.ReadInt64(), BitmapUsed = r.ReadBoolean(), ReadSeconds = r.ReadDouble(), ParseSeconds = r.ReadDouble(), BuildSeconds = r.ReadDouble(), SaveSeconds = r.ReadDouble(), AdjustedAfterCleanup = r.ReadBoolean(), CleanupAdjustments = r.ReadInt32(), VolumeSerial = r.ReadUInt32(), Count = r.ReadInt32() };
+        var r = header; var s = ReadHeader(r, out byte codec);
         int count = r.ReadInt32(), chars = r.ReadInt32(), children = r.ReadInt32(), dirs = r.ReadInt32();
         using Stream source = codec switch { 0 => fs, 1 => new ZLibStream(fs, CompressionMode.Decompress, true), 2 => new BrotliStream(fs, CompressionMode.Decompress, true), _ => throw new InvalidDataException("Invalid snapshot codec") };
         using var body = new BinaryReader(source, Encoding.UTF8, true);

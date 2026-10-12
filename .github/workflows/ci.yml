@@ -31,7 +31,7 @@ jobs:
           RELEASE_REF: ${{ github.ref_name }}
           RELEASE_TYPE: ${{ github.ref_type }}
         run: |
-          $version = if ($env:RELEASE_TYPE -eq 'tag') { $env:RELEASE_REF.TrimStart('v') } else { '1.0.1' }
+          $version = if ($env:RELEASE_TYPE -eq 'tag') { $env:RELEASE_REF.TrimStart('v') } else { '1.1.0' }
           ./scripts/package.ps1 -Version $version
       - name: Packaged MCP and CLI smoke tests
         shell: pwsh

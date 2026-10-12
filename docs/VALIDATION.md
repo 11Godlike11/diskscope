@@ -1,5 +1,13 @@
 # Release validation
 
+## 1.1.0
+
+Local verification on Windows 11 x64, NTFS, .NET SDK 10.0.103:
+
+- **127 core checks**, adding MFT bitmap skipping, compact-index alias/query behavior, v3 snapshot roundtrips (ZLib and uncompressed), segmented buffers, extension merging, cleanup index adjustment, compact/verbose output rules, shares and type categories.
+- **44 packaged protocol/CLI checks**, adding `wait_seconds` waits, concurrent requests during a wait, progress notifications, `disk_types`, and clean shutdown with stdin closed.
+- Live direct-MFT scans of local NTFS volumes matched the 1.0.1 indexed, invalid and unresolved record counts. Timings are in `docs/PERFORMANCE.md`; they are measurements on one machine, not a throughput guarantee.
+
 ## 1.0.1
 
 Local verification on Windows 11 x64, NTFS, .NET SDK 10.0.103:
