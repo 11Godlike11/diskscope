@@ -78,8 +78,12 @@ For cleanup, start a preview and poll disk_job_status to completion.
 Review exact selected paths, file count, and estimated savings against authorized scope.
 Execute only that authorized plan and poll it through completion or failure.
 On failure/timeout inspect status/audit; do not replay a plan.
-Rescan after deletion, read live free space, and call disk_release when finished.
+After deletion, read next_action: matching loaded indexes are adjusted and saved; unloaded, replaced, or mismatched indexes require a rescan. Read live free space and call disk_release when finished. Unrelated live changes still require a new scan.
 ```
+
+Scan payloads retain their existing fields and add `total_record_slots`, `bitmap_used`, `raw_records_meaning`, `timings` (`read`, `parse`, `build`, `save`, seconds), `adjusted_after_cleanup`, and `cleanup_adjustments`. `raw_records` counts slots actually read/enumerated, including holes retained in merged bitmap ranges; it is not the total MFT slot count. Read and parse overlap: read includes bootstrap plus the busiest reader's active read time; parse is the busiest parser's active time. Build and save are separate elapsed phases, so timings do not sum to `scan_seconds`. `scan_seconds` excludes saving, as before. Timings survive v3 snapshot reloads. `cleanup_adjustments` counts successfully removed index names.
+
+`disk_volumes` adds `snapshot_format_current`. v1/v2 snapshots report false and queries return `快照格式已过期，请重新 disk_scan`. Missing snapshots also report false. Other CLI/MCP response shapes and accounting fields are retained.
 
 ## Raw CLI access
 

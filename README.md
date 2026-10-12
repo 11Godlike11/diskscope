@@ -19,7 +19,7 @@ It ships as a self-contained executable with a JSON CLI and a standard **stdio M
 
 - **Progressive exploration:** volume summary → one directory level → selected large files.
 - **Physical allocation accounting:** distinguish sparse logical sizes and count hard-linked storage once.
-- **Metadata scans:** read the NTFS MFT directly, with fixed 512-byte update-sequence repair on both 512-byte and 4K native-sector volumes, and an NTFS control-code fallback when raw reads are blocked.
+- **Metadata scans:** skip empty MFT ranges using its bitmap, overlap bounded reads and parsing, and repair fixed 512-byte update sequences on both 512-byte and 4K native-sector volumes. Full reads and NTFS control codes remain fallbacks.
 - **Reviewed cleanup:** preview an exact file set, check current identity and metadata, then delete only that set.
 - **Background MCP jobs:** scans, cleanup previews, and deletion return a job ID immediately; poll progress through completion.
 - **Bounded resident indexes:** cache one volume, release idle indexes after 120 seconds, or explicitly call `disk_release`.
@@ -102,7 +102,11 @@ Cleanup uses three separate calls:
 
 The MCP server keeps at most one loaded volume index and evicts it after the idle timeout. `disk_release` unloads it immediately while retaining the snapshot on disk. Configure `--idle-seconds 30` for a shorter idle window.
 
-Large scans still need memory proportional to the volume's file count. Windows may also grow its own filesystem cache during heavy metadata I/O. Releasing DiskScope's index does **not** flush the system cache or change other programs. DiskScope does not install services or apply global memory limits.
+The resident index uses packed records, shared UTF-16 names, CSR children, and totals stored only for directories. v3 snapshots use contiguous uncompressed arrays for bulk loading; they are larger on disk than v2 compressed snapshots. v1/v2 snapshots must be recreated with `disk_scan`; `disk_volumes.snapshot_format_current` identifies usable formats. Scan info reports read/parse/build/save timings and distinguishes actually read `raw_records` from `total_record_slots`. [Measurements and tradeoffs](docs/PERFORMANCE.md).
+
+Large scans still need memory proportional to the volume's file count, including temporary construction buffers. Windows may also grow its own filesystem cache during heavy metadata I/O. Releasing DiskScope's index does **not** flush the system cache or change other programs. DiskScope does not install services or apply global memory limits.
+
+After cleanup, a matching loaded index removes the successfully deleted names, keeps hard-linked allocation until the final name is removed, and saves the adjusted snapshot. Scan info reports `adjusted_after_cleanup` and `cleanup_adjustments`. If the index is unloaded, replaced, or no longer matches the planned identity/link count, the result's existing `next_action` asks for a rescan. Incremental adjustment does not track unrelated live changes; rescan for a fresh volume-wide view.
 
 MCP scan, preview, and execute calls return `job_id`. Use `disk_job_status` until `complete` or `failed`, and keep the server alive. After a timeout, inspect the running job or durable audit rather than replaying deletion. [Job workflow](docs/MCP.md#background-jobs).
 

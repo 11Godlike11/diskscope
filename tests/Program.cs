@@ -46,6 +46,124 @@ static class Tests
             Check(!NtfsScanner.Fixup(b), $"{size}-byte FILE record rejects an incomplete USA");
         }
     }
+    static void TestBitmap()
+    {
+        byte[] bits = new byte[32]; bits[0] = 0x21;
+        bits[1] |= 1; bits[10] |= 1; bits[31] |= 0x80;
+        var segments = NtfsScanner.BitmapSegments(bits, 256, 1024);
+        Check(segments.Count == 3 && segments[0] == new NtfsScanner.ReadSegment(0, 16 * 1024) && segments[1] == new NtfsScanner.ReadSegment(80 * 1024, 8 * 1024) && segments[2] == new NtfsScanner.ReadSegment(248 * 1024, 8 * 1024), "Bitmap merges adjacent blocks and small holes, skips large empty ranges");
+        bits = new byte[2]; bits[0] = 0x21; bits[1] = 0x80;
+        Check(NtfsScanner.BitmapSegments(bits, 16, 1024).Single().Length == 16 * 1024, "Bitmap includes a final partial read block");
+        Throws<InvalidDataException>(() => NtfsScanner.BitmapSegments(new byte[1], 16, 1024), "Incomplete", "Truncated bitmap triggers full-read fallback");
+        Throws<InvalidDataException>(() => NtfsScanner.BitmapSegments(new byte[2], 16, 1024), "root missing", "Empty or stale bitmap triggers full-read fallback");
+    }
+    static Snapshot Synthetic()
+    {
+        var s = new Snapshot { Root = "C:\\", RootId = 1, CreatedUtc = DateTime.UtcNow, TotalRecordSlots = 100, BitmapUsed = true, ReadSeconds = 1.2, ParseSeconds = .3, BuildSeconds = .4 };
+        var b = new IndexBuilder();
+        foreach (var e in new Entry[] {
+            new() { Id = 1, Directory = true },
+            new() { Id = 2, Directory = true, Names = [new(1, "dir", 1)] },
+            new() { Id = 3, Logical = 100, Allocated = 4096, Names = [new(1, "z", 1), new(2, "a", 1), new(2, "A~1", 2)] },
+            new() { Id = 4, Logical = 200, Allocated = 8192, Names = [new(2, "other", 1)] },
+            new() { Id = 5, Directory = true, Names = [new(2, "sub", 1)] },
+            new() { Id = 6, Logical = 50, Allocated = 2048, Names = [new(5, "nested", 1)] },
+            new() { Id = 7, Logical = 9, Names = [new(999, "orphan", 1)] } }) b.Add(e);
+        s.Build([b]); return s;
+    }
+    static void TestCompact(string root)
+    {
+        var buffer = new SegmentBuffer<int>(3); buffer.Append(new[] { 1, 2, 3, 4, 5 }); buffer.Add(6); buffer.Add(7); var values = new int[7]; buffer.CopyTo(values);
+        Check(values.SequenceEqual(Enumerable.Range(1, 7)) && buffer.Count == 7, "Segment buffers preserve records across append/copy boundaries");
+        var extension = new Snapshot { Root = "C:\\", RootId = 1 }; var extBuilder = new IndexBuilder();
+        extBuilder.Add(new() { Id = 1, Directory = true }); extBuilder.Add(new() { Id = 10, Logical = 1, Allocated = 1024, Names = [new(1, "DOS~1", 2)] });
+        extBuilder.Extensions.Add((10, new() { Id = 11, Logical = 2, Allocated = 2048, Names = [new(1, "long name", 1)] })); extension.Build([extBuilder]);
+        Check(extension.Get(10).Allocated == 3072 && extension.Get(10).Logical == 3 && extension.PathOf(10) == "C:\\long name" && extension.Get(10).Links == 1, "Extension records merge into base IDs and retain DOS/long namespace selection");
+        foreach (string backend in new[] { "ntfs-mft", "ntfs-mft-ioctl" })
+        {
+            var ordered = new Snapshot { Root = "C:\\", RootId = 1, Backend = backend }; var baseBuilder = new IndexBuilder(); var otherBuilder = new IndexBuilder();
+            baseBuilder.Add(new() { Id = 1, Directory = true }); baseBuilder.Add(new() { Id = 2, Names = [new(1, "x", 1)] }); baseBuilder.Add(new() { Id = 3, Names = [new(1, "y", 1)] });
+            baseBuilder.Extensions.Add((2, new() { Id = 20, Names = [new(1, "a", 1)] })); otherBuilder.Extensions.Add((2, new() { Id = 10, Names = [new(1, "b", 1)] })); ordered.Build([baseBuilder, otherBuilder]);
+            Check(ordered.Get(2).Names.Select(n => n.Name).SequenceEqual(backend == "ntfs-mft" ? new[] { "x", "b", "a" } : new[] { "x", "a", "b" }), $"{backend} preserves extension-name order across parser workers");
+            Check(ordered.Get(1).Children.SequenceEqual(backend == "ntfs-mft" ? new ulong[] { 2, 3 } : new ulong[] { 3, 2 }), $"{backend} preserves child traversal order and Largest tie behavior");
+        }
+        var many = new Snapshot { Root = "C:\\", RootId = 1 }; var manyBuilder = new IndexBuilder();
+        manyBuilder.Add(new() { Id = 1, Directory = true }); manyBuilder.Add(new() { Id = 2, Allocated = 4096, Names = Enumerable.Range(0, 32).Select(i => new LinkName(1, $"link{i:00}", 1)).ToList() }); many.Build([manyBuilder]);
+        Check(many.ListChildren(1).Count() == 32 && many.Resolve("C:\\link31") == 2 && many.Get(1).TotalAllocated == 4096, "Name deduplication handles more unique hard-link names than records");
+        Check(many.RemoveName("C:\\link00", 2) && many.ListChildren(1).Count() == 31 && many.Get(1).ChildCount == 1 && many.PathOf(2) == "C:\\link01", "Same-parent canonical transfer never duplicates CSR children");
+        var unresolved = new Snapshot { Root = "C:\\", RootId = 1 }; var orphanBuilder = new IndexBuilder();
+        orphanBuilder.Add(new() { Id = 1, Directory = true }); orphanBuilder.Add(new() { Id = 2, Directory = true, Names = [new(999, "orphan", 1)] });
+        orphanBuilder.Add(new() { Id = 3, Allocated = 4096, Names = [new(1, "a", 1), new(2, "z", 1)] }); unresolved.Build([orphanBuilder]);
+        Check(unresolved.RemoveName("C:\\a", 3) && unresolved.Unresolved == 2 && unresolved.Get(1).Files == 0 && unresolved.Get(1).TotalAllocated == 0 && unresolved.PathOf(3) == "[unresolved]", "Canonical transfer into an unresolved subtree updates reachability and root totals");
+        var s = Synthetic();
+        Check(s.Resolve("C:\\DIR\\A") == 3 && s.Resolve("C:\\z") == 3 && s.PathOf(3) == "C:\\dir\\a", "Compact index preserves case-insensitive lookup, aliases and canonical paths");
+        Check(s.Get(1).Files == 3 && s.Get(1).Directories == 2 && s.Get(1).TotalAllocated == 14336 && s.Unresolved == 1, "Compact CSR rollup preserves directory and unresolved accounting");
+        Check(s.ListChildren(1).Count() == 2 && s.ListChildren(1).Single(e => e.Alias).Name == "z", "Compact children include aliases without duplicate physical accounting");
+        string file = Path.Combine(root, "compact.dscope");
+        foreach (byte codec in new byte[] { 0, 1, 2 })
+        {
+            s.Save(file, codec); var copy = Snapshot.Load(file);
+            Check(copy.Resolve("C:\\z") == 3 && copy.Get(1).TotalAllocated == 14336 && copy.PathOf(6) == "C:\\dir\\sub\\nested" && copy.Unresolved == 1 && copy.SaveSeconds > 0 && copy.ReadSeconds == 1.2, $"v3 block snapshot roundtrip codec {codec} preserves fields and timings");
+        }
+        string cache = Path.Combine(root, "compact-state"); Directory.CreateDirectory(cache); s.Save(Path.Combine(cache, "C.dscope"));
+        using (var service = new Service(cache))
+        {
+            var largest = service.Largest("C:\\", 2, 0, null, null);
+            Check(Field<long>(largest, "matching_files") == 3 && Field<object[]>(largest, "items").Length == 2 && JsonSerializer.SerializeToElement(largest, Program.JsonOptions).GetProperty("items")[0].GetProperty("name").GetString() == "other", "Largest traverses compact CSR and preserves ranking");
+            var browse = service.Browse("C:\\dir", 1, 0, "allocated");
+            Check(Field<long>(browse, "omitted_allocated_bytes") == 6144 && Field<int>(browse, "next_offset") == 1 && Field<int>(browse, "total_children") == 3, "Browse preserves sorting, pagination and omitted allocation");
+        }
+        s = Synthetic(); Check(s.RemoveName("C:\\z", 3) && s.Get(1).TotalAllocated == 14336 && s.Get(3).Links == 1 && !s.ListChildren(1).Any(x => x.Alias), "Deleting a noncanonical hard link keeps physical totals");
+        Throws<FileNotFoundException>(() => s.Resolve("C:\\z"), "absent", "Deleted alias no longer resolves");
+        Check(s.RemoveName("C:\\dir\\a", 3) && s.Get(1).TotalAllocated == 10240 && s.Get(2).TotalLogical == 250 && s.Get(1).Files == 2 && s.Count == 6, "Deleting the final link subtracts allocation, logical size and files along ancestors");
+        s = Synthetic();
+        Check(s.RemoveName("C:\\dir\\a", 3) && s.Get(2).TotalAllocated == 10240 && s.Get(1).TotalAllocated == 14336 && s.PathOf(3) == "C:\\z" && s.Resolve("C:\\z") == 3, "Deleting the canonical link transfers ownership to a remaining name");
+        s.Save(file); s = Snapshot.Load(file);
+        Check(s.AdjustedAfterCleanup && s.CleanupAdjustments == 1 && s.Get(3).Links == 1 && s.ListChildren(1).Any(x => !x.Alias && x.Name == "z"), "Adjusted v3 snapshot persists transferred canonical children and flags");
+        Check(s.RemoveName("C:\\z", 3) && s.RemoveName("C:\\dir\\sub\\nested", 6) && s.Get(1).TotalAllocated == 8192 && s.Get(2).Files == 1 && s.Get(5).Files == 0 && s.Get(1).Directories == 2, "Full hard-link deletion and nested file deletion retain empty directories and totals");
+        Throws<FileNotFoundException>(() => s.Resolve("C:\\dir\\sub\\nested"), "absent", "Deleted canonical child no longer resolves");
+        string old = Path.Combine(root, "old.dscope");
+        using (var fs = File.Create(old)) using (var zip = new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionLevel.Fastest)) using (var w = new BinaryWriter(zip)) w.Write("DiskScope-2");
+        Check(!Snapshot.FormatCurrent(old), "v2 snapshots are marked noncurrent");
+        Throws<InvalidDataException>(() => Snapshot.Load(old), "disk_scan", "v2 load reports a clear rescan requirement");
+    }
+    static void TestCleanupAdjustment(string root)
+    {
+        string fixture = Path.Combine(root, "adjust"); Directory.CreateDirectory(fixture);
+        string first = Path.Combine(fixture, "first.dat"), second = Path.Combine(fixture, "second.dat"); File.WriteAllBytes(first, new byte[8193]);
+        using (var process = Process.Start(new ProcessStartInfo("fsutil", $"hardlink create \"{second}\" \"{first}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!) { process.WaitForExit(); Check(process.ExitCode == 0, "Incremental cleanup hard-link fixture created"); }
+        long fixtureAllocation = ReadEntry(first).Allocated;
+        string volumeRoot = Path.GetPathRoot(fixture)!; var s = new Snapshot { Root = volumeRoot, CreatedUtc = DateTime.UtcNow };
+        var builder = new IndexBuilder();
+        string? path = fixture;
+        while (path != null)
+        {
+            using var h = Native.Open(path); var info = Native.Info(h); var entry = ReadEntry(path); builder.Add(entry);
+            if (path.Equals(volumeRoot, StringComparison.OrdinalIgnoreCase)) { s.RootId = entry.Id; s.VolumeSerial = info.Serial; break; }
+            path = Path.GetDirectoryName(path);
+        }
+        builder.Add(ReadEntry(first)); s.Build([builder]); string cache = Path.Combine(root, "adjust-state"); Directory.CreateDirectory(cache); string file = Path.Combine(cache, volumeRoot[0] + ".dscope"); s.Save(file);
+        using var service = new Service(cache); var cleaner = new Cleanup(service); service.Get(first);
+        long before = service.Get(first).Get(s.RootId).TotalAllocated;
+        var plan = cleaner.Plan([first], 10); var result = cleaner.Execute(Field<string>(plan, "plan_id"), Field<string>(plan, "confirm_token"));
+        Check(Field<string>(result, "next_action").Contains("Adjusted 1") && service.Get(second).Get(s.RootId).TotalAllocated == before && Snapshot.Load(file).CleanupAdjustments == 1, "Executor adjusts and saves a matching loaded snapshot after partial link deletion");
+        plan = cleaner.Plan([second], 10); result = cleaner.Execute(Field<string>(plan, "plan_id"), Field<string>(plan, "confirm_token"));
+        Check(Field<string>(result, "next_action").Contains("Adjusted 1") && service.Get(fixture).Get(s.RootId).TotalAllocated == before - fixtureAllocation && Snapshot.Load(file).CleanupAdjustments == 2, "Executor saves final hard-link allocation deduction without changing safety checks");
+        // Re-index only new owned fixtures to exercise stale snapshot and external link-count changes.
+        string stale = Path.Combine(fixture, "stale.dat"), changed = Path.Combine(fixture, "changed.dat"), external = Path.Combine(fixture, "external.dat");
+        File.WriteAllBytes(stale, new byte[4097]); File.WriteAllBytes(changed, new byte[4097]);
+        builder = new IndexBuilder(); path = fixture;
+        while (path != null) { builder.Add(ReadEntry(path)); if (path.Equals(volumeRoot, StringComparison.OrdinalIgnoreCase)) break; path = Path.GetDirectoryName(path); }
+        builder.Add(ReadEntry(stale)); builder.Add(ReadEntry(changed)); s = new Snapshot { Root = volumeRoot, RootId = s.RootId, CreatedUtc = DateTime.UtcNow, VolumeSerial = s.VolumeSerial }; s.Build([builder]); s.Save(file); service.Release(); service.Get(stale);
+        File.SetLastWriteTimeUtc(file, File.GetLastWriteTimeUtc(file).AddSeconds(1)); plan = cleaner.Plan([stale], 10); result = cleaner.Execute(Field<string>(plan, "plan_id"), Field<string>(plan, "confirm_token"));
+        Check(Field<string>(result, "next_action").Contains("1 names require a rescan") && service.Get(fixture).Contains(ReadEntry(changed).Id), "Cleanup refuses to adjust a cached snapshot replaced on disk");
+        service.Release(); service.Get(changed);
+        using (var process = Process.Start(new ProcessStartInfo("fsutil", $"hardlink create \"{external}\" \"{changed}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!) { process.WaitForExit(); Check(process.ExitCode == 0, "External hard-link change fixture created"); }
+        plan = cleaner.Plan([changed], 10); result = cleaner.Execute(Field<string>(plan, "plan_id"), Field<string>(plan, "confirm_token"));
+        Check(Field<string>(result, "next_action").Contains("1 names require a rescan") && File.Exists(external) && !service.Get(fixture).AdjustedAfterCleanup, "Link-count drift skips index deductions and preserves the external link");
+        string skip = Path.Combine(fixture, "skip.txt"); File.WriteAllText(skip, "fixture"); plan = cleaner.Plan([skip], 10); service.Release(); result = cleaner.Execute(Field<string>(plan, "plan_id"), Field<string>(plan, "confirm_token"));
+        Check(Field<string>(result, "next_action").Contains("1 names require a rescan"), "Cleanup with an unloaded index requests rescan");
+    }
     static Entry ReadEntry(string path)
     {
         using var f = Native.Open(path); var info = Native.Info(f);
@@ -60,7 +178,7 @@ static class Tests
         string root = Path.GetFullPath(args[0]);
         if (Directory.Exists(root) || File.Exists(root)) throw new InvalidOperationException("Test directory already exists; choose a new fixture path");
         Directory.CreateDirectory(root);
-        TestFixup();
+        TestFixup(); TestBitmap(); TestCompact(root); TestCleanupAdjustment(root);
         string cache = Path.Combine(root, "state"); using var service = new Service(cache); var cleaner = new Cleanup(service);
         string fixture = Path.Combine(root, "fixture"); Directory.CreateDirectory(fixture);
         string regular = Path.Combine(fixture, "大 文件.dat"); File.WriteAllBytes(regular, new byte[1048577]);
@@ -142,10 +260,10 @@ static class Tests
         var snap = new Snapshot { Root = "C:\\", RootId = 1, CreatedUtc = DateTime.UtcNow };
         var r = new Entry { Id = 1, Directory = true }; var d = new Entry { Id = 2, Directory = true, Names = [new(1, "dir", 1)] };
         var hard = new Entry { Id = 3, Links = 2, Logical = 100, Allocated = 4096, Names = [new(1, "z", 1), new(2, "a", 1)] };
-        snap.Entries = new() { [1] = r, [2] = d, [3] = hard }; snap.Build();
-        Check(r.TotalAllocated == 4096 && r.Files == 1, "Hard-linked allocation counted once across directory rollup");
+        var builder = new IndexBuilder(); foreach (var entry in new[] { r, d, hard }) builder.Add(entry); snap.Build([builder]);
+        Check(snap.Get(1).TotalAllocated == 4096 && snap.Get(1).Files == 1, "Hard-linked allocation counted once across directory rollup");
         string snapshotFile = Path.Combine(root, "roundtrip.dscope"); snap.Save(snapshotFile); var restored = Snapshot.Load(snapshotFile);
-        Check(restored.Entries[1].TotalAllocated == 4096 && restored.Resolve("C:\\dir\\a") == 3 && restored.Resolve("C:\\z") == 3, "Snapshot roundtrip and hard-link alias resolution");
+        Check(restored.Get(1).TotalAllocated == 4096 && restored.Resolve("C:\\dir\\a") == 3 && restored.Resolve("C:\\z") == 3, "Snapshot roundtrip and hard-link alias resolution");
         Check(restored.ListChildren(1).Any(x => x.Alias && x.Name == "z"), "Hard-link aliases appear in directory listing without duplicate allocation");
         Directory.CreateDirectory(cache); snap.Save(Path.Combine(cache, "C.dscope"));
         service.Get("C:\\dir"); Check(service.LoadedCount == 1, "Snapshot is cached after query");

@@ -33,6 +33,8 @@ Cleanup also refuses alternate-stream selections and UNC paths. The tool does no
 
 MFT update-sequence repair uses fixed 512-byte boundaries, including on volumes with 4096-byte native sectors. The scan is taken on an active volume and is not a VSS consistent snapshot or a real-time USN monitor. Concurrent file changes can affect the result. Rescan after meaningful changes and use live metadata before cleanup.
 
+Cleanup adjustment runs after successful deletions have been durably audited, without changing preflight, handle checks, ancestor locks, replay protection, or stop-on-error behavior. Only matching, already loaded snapshots are adjusted. The volume serial, snapshot write time/length, file identity, selected name, and expected remaining link count must match. Removing an alias retains physical storage; removing the canonical name transfers its ownership to a remaining name; removing the final name subtracts storage and file counts along its reachable parent chain. Empty directories remain. Adjustment metadata and the updated snapshot are saved atomically. If adjustment fails, the cache is evicted and `next_action` requests a rescan; never replay deletion to retry an index update.
+
 ## Privacy and memory
 
 DiskScope does not upload data or make application-level network requests. Local snapshots, preview files, and audit logs contain sensitive filenames. They are excluded from the source repository and release bundles. Share minimal redacted reproduction cases rather than raw scans.

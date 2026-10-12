@@ -183,7 +183,8 @@ sealed class Cleanup(Service service)
         }
         Record(new { state = "finished", deleted, failed = failures.Count });
         progress?.Invoke(new("finished", deleted + failures.Count, p.Files.Length, deleted));
-        return new { plan_id = id, deleted_files = deleted, estimated_freed_bytes = estimated, failures, stopped_on_first_error = failures.Count > 0, unattempted_files = p.Files.Length - deleted - failures.Count, audit_path = audit, next_action = "Rescan the affected volume; disk_volumes reports current free space. Empty directories remain." };
+        string next = service.AdjustAfterCleanup(p.Files.Take(deleted));
+        return new { plan_id = id, deleted_files = deleted, estimated_freed_bytes = estimated, failures, stopped_on_first_error = failures.Count > 0, unattempted_files = p.Files.Length - deleted - failures.Count, audit_path = audit, next_action = next };
     }
     public object ExecutionStatus(string id)
     {
