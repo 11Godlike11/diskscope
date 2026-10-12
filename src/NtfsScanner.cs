@@ -180,15 +180,15 @@ static class NtfsScanner
     static uint U32(ReadOnlySpan<byte> b, int p) => BinaryPrimitives.ReadUInt32LittleEndian(b[p..]);
     static ulong U64(ReadOnlySpan<byte> b, int p) => BinaryPrimitives.ReadUInt64LittleEndian(b[p..]);
     static long I64(ReadOnlySpan<byte> b, int p) => BinaryPrimitives.ReadInt64LittleEndian(b[p..]);
-    static bool Fixup(Span<byte> b, int sector, bool cooked = false)
+    internal static bool Fixup(Span<byte> b, bool cooked = false)
     {
         if (b.Length < 48 || U32(b, 0) != 0x454c4946) return false;
         int off = U16(b, 4), count = U16(b, 6);
-        if (off < 8 || off + count * 2 > b.Length || count < 2) return false;
+        if (off < 8 || off + count * 2 > b.Length || count < 2 || (count - 1) * 512 != b.Length) return false;
         ushort seq = U16(b, off);
         for (int i = 1; i < count; i++)
         {
-            int end = sector * i - 2; if (end + 2 > b.Length) return false;
+            int end = 512 * i - 2; // NTFS update-sequence stride is independent of the volume's sector size.
             if (U16(b, end) != seq) { if (cooked) continue; return false; }
             b[end] = b[off + 2 * i]; b[end + 1] = b[off + 2 * i + 1];
         }
@@ -220,12 +220,12 @@ static class NtfsScanner
         }
         return runs;
     }
-    internal static byte[] Record(SafeFileHandle volume, ulong id, int recordSize, int sector)
+    internal static byte[] Record(SafeFileHandle volume, ulong id, int recordSize)
     {
         var output = Native.Ioctl(volume, 0x90068, BitConverter.GetBytes(id & 0xffffffffffffUL), recordSize + 16);
         if (output.Length < recordSize + 12 || (U64(output, 0) & 0xffffffffffffUL) != (id & 0xffffffffffffUL)) throw new InvalidDataException("MFT extension record unavailable");
         byte[] b = output[12..(12 + recordSize)];
-        if (!Fixup(b, sector, true)) throw new InvalidDataException("Invalid MFT bootstrap record");
+        if (!Fixup(b, true)) throw new InvalidDataException("Invalid MFT bootstrap record");
         return b;
     }
     public static Snapshot Scan(string root, Action<long, long>? progress = null)
@@ -241,9 +241,9 @@ static class NtfsScanner
         try { Native.ReadAt(volume, I64(v, 64) * cluster, new byte[cluster], cluster); }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode is 1 or 5 or 50 or 87)
         {
-            return ScanControlRecords(volume, s, valid, rs, sector, cluster, watch, progress);
+            return ScanControlRecords(volume, s, valid, rs, cluster, watch, progress);
         }
-        byte[] rec0 = Record(volume, 0, rs, sector); var mftRuns = new List<Run>(); var attrLists = new List<byte[]>();
+        byte[] rec0 = Record(volume, 0, rs); var mftRuns = new List<Run>(); var attrLists = new List<byte[]>();
         void Bootstrap(byte[] b)
         {
             foreach (var (off, len) in Attributes(b))
@@ -278,7 +278,7 @@ static class NtfsScanner
                 if (U32(list, p) == 0x80 && list[p + 6] == 0)
                 {
                     ulong id = U64(list, p + 16) & 0xffffffffffffUL;
-                    if (id != 0 && extraIds.Add(id)) Bootstrap(Record(volume, id, rs, sector));
+                    if (id != 0 && extraIds.Add(id)) Bootstrap(Record(volume, id, rs));
                 }
                 p += len;
             }
@@ -297,7 +297,7 @@ static class NtfsScanner
                 for (int p = 0; p < n; p += rs)
                 {
                     s.RawRecords++; var b = buf.AsSpan(p, rs); if (U32(b, 0) != 0x454c4946 || (U16(b, 22) & 1) == 0) continue;
-                    if (!Fixup(b, sector)) { s.InvalidRecords++; continue; }
+                    if (!Fixup(b)) { s.InvalidRecords++; continue; }
                     ulong ordinal = (ulong)((r.Vcn * cluster + pos + p) / rs); ulong id = ordinal | ((ulong)U16(b, 16) << 48);
                     try
                     {
@@ -318,7 +318,7 @@ static class NtfsScanner
         if (!s.Entries.ContainsKey(s.RootId)) throw new InvalidDataException("MFT root directory missing");
         s.Build(); s.Seconds = watch.Elapsed.TotalSeconds; return s;
     }
-    static Snapshot ScanControlRecords(SafeFileHandle volume, Snapshot s, long valid, int rs, int sector, int cluster, Stopwatch watch, Action<long,long>? progress)
+    static Snapshot ScanControlRecords(SafeFileHandle volume, Snapshot s, long valid, int rs, int cluster, Stopwatch watch, Action<long,long>? progress)
     {
         s.Backend = "ntfs-mft-ioctl";
         byte[] input = new byte[8], output = new byte[rs + 16]; ulong requested = (ulong)(valid / rs - 1);
@@ -332,7 +332,7 @@ static class NtfsScanner
             ulong ordinal = U64(output, 0) & 0xffffffffffffUL;
             if (ordinal > requested) throw new InvalidDataException("MFT enumeration did not advance");
             var b = output.AsSpan(12, rs); s.RawRecords++;
-            if (!Fixup(b, sector, true)) s.InvalidRecords++;
+            if (!Fixup(b, true)) s.InvalidRecords++;
             else
             {
                 try

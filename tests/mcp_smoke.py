@@ -61,7 +61,7 @@ class Client:
     def initialize(self):
         result = self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
             "clientInfo": {"name": "diskscope-smoke", "version": "1"}})["result"]
-        check(result["serverInfo"]["version"] == "1.0.0", "Packaged MCP version")
+        check(result["serverInfo"]["version"] == "1.0.1", "Packaged MCP version")
         self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         self.process.stdin.flush()
 

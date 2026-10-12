@@ -19,7 +19,7 @@ It ships as a self-contained executable with a JSON CLI and a standard **stdio M
 
 - **Progressive exploration:** volume summary → one directory level → selected large files.
 - **Physical allocation accounting:** distinguish sparse logical sizes and count hard-linked storage once.
-- **Metadata scans:** read the NTFS MFT directly, with an NTFS control-code fallback when raw reads are blocked.
+- **Metadata scans:** read the NTFS MFT directly, with fixed 512-byte update-sequence repair on both 512-byte and 4K native-sector volumes, and an NTFS control-code fallback when raw reads are blocked.
 - **Reviewed cleanup:** preview an exact file set, check current identity and metadata, then delete only that set.
 - **Background MCP jobs:** scans, cleanup previews, and deletion return a job ID immediately; poll progress through completion.
 - **Bounded resident indexes:** cache one volume, release idle indexes after 120 seconds, or explicitly call `disk_release`.
@@ -96,7 +96,7 @@ Cleanup uses three separate calls:
 .\DiskScope.exe execution-status PLAN_ID
 ```
 
-**Deletion is permanent, bypasses the Recycle Bin, and is not transactional.** Plans expire after one hour. Execution refuses changed files and reparse-point ancestors, prevents plan replay, records each deletion, and stops on the first file error. New files and directories remain. A confirmation token identifies a plan; it does not represent user authorization. [Safety and accounting details](docs/SAFETY.md).
+**Deletion is permanent, bypasses the Recycle Bin, and is not transactional.** Plans expire after one hour. Execution refuses changed files and reparse-point ancestors, locks ancestors against rename/delete, checks the handle's final path against the expected and protected paths, prevents plan replay, records each deletion, and stops on the first file error. Read-only files can be deleted through `FileDispositionInfoEx`; unsupported systems fall back to legacy deletion, which may reject read-only files. New files and directories remain. A confirmation token identifies a plan; it does not represent user authorization. [Safety and accounting details](docs/SAFETY.md).
 
 ## Memory and long operations
 

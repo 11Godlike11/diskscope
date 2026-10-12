@@ -1,5 +1,14 @@
 # Release validation
 
+## 1.0.1
+
+Local verification on Windows 11 x64, NTFS, .NET SDK 10.0.103:
+
+- **55 core checks**, adding synthetic 1 KiB / 4 KiB MFT update-sequence records, `\\?\`, `\\.\` and UNC protected-path refusals, effective ancestor locking, final handle-path comparison, read-only file deletion, and exact refusal reasons.
+- **24 packaged protocol/CLI checks** against the rebuilt self-contained executable.
+- A live direct-MFT scan of a local NTFS volume matched the 1.0.0 record counts with zero parse failures.
+- The 4 KiB update-sequence path is covered by synthetic records only; it was not verified on physical 4Kn hardware.
+
 ## 1.0.0
 
 Local verification on Windows 11 x64, NTFS, .NET SDK 10.0.103:

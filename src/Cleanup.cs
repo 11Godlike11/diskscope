@@ -30,7 +30,7 @@ sealed class Cleanup(Service service)
             throw new InvalidOperationException("Protected volume file");
     }
     // Keep every ancestor pinned against rename/delete; reject junctions and symlinks at each level.
-    List<SafeFileHandle> LockAncestors(string path)
+    internal List<SafeFileHandle> LockAncestors(string path)
     {
         var handles = new List<SafeFileHandle>();
         try
@@ -38,7 +38,7 @@ sealed class Cleanup(Service service)
             string? current = System.IO.Path.GetDirectoryName(path);
             while (current != null)
             {
-                var h = Native.Open(Native.LongPath(current), 0, 3); handles.Add(h);
+                var h = Native.Open(Native.LongPath(current), 0x1 | 0x80, 3); handles.Add(h); // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, no delete sharing
                 if ((Native.Info(h).Attributes & 0x400) != 0) throw new InvalidOperationException("Cleanup through a reparse-point ancestor is refused");
                 current = System.IO.Path.GetDirectoryName(current);
             }
@@ -46,12 +46,23 @@ sealed class Cleanup(Service service)
         }
         catch { foreach (var h in handles) h.Dispose(); throw; }
     }
+    internal static void CheckPathMatches(string expected, string actual)
+    {
+        if (expected.StartsWith(@"\\?\")) expected = expected[4..];
+        if (actual.StartsWith(@"\\?\")) actual = actual[4..];
+        if (!expected.Equals(actual, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException($"Handle path does not match expected path: {expected}");
+    }
+    void CheckHandlePath(string expected, SafeFileHandle h)
+    {
+        string actual = Native.FinalPath(h); CheckAllowed(actual); CheckPathMatches(expected, actual);
+    }
     PlannedFile Inspect(string path)
     {
         CheckAllowed(path); var ancestors = LockAncestors(path);
         try
         {
             using var h = Native.Open(Native.LongPath(path), 0, 1); var i = Native.Info(h);
+            CheckHandlePath(path, h);
             if ((i.Attributes & (0x400 | 0x10)) != 0) throw new InvalidOperationException("Cleanup accepts regular files only; no reparse points");
             return new(path, i.Identity, i.Serial, i.Size, i.Write, Native.Allocation(h), i.Links);
         }
@@ -152,11 +163,17 @@ sealed class Cleanup(Service service)
             {
                 CheckAllowed(f.Path); ancestors = LockAncestors(f.Path);
                 using var h = Native.Open(Native.LongPath(f.Path), 0x10000 | 0x80, 1); // DELETE | FILE_READ_ATTRIBUTES, deny writes and renames
+                CheckHandlePath(f.Path, h);
                 var i = Native.Info(h); var identity = (f.Serial, f.Id);
                 uint removed = removedLinks.GetValueOrDefault(identity);
                 CheckSame(f, i, Native.Allocation(h), f.Links - removed);
                 Record(new { state = "delete_intent", path = f.Path, file_id = f.Id.ToString("x16") });
-                if (!Native.SetFileInformationByHandle(h, 4, BitConverter.GetBytes(1), 4)) throw new Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+                if (!Native.SetFileInformationByHandle(h, 21, BitConverter.GetBytes(0x1u | 0x2u | 0x10u), 4)) // FileDispositionInfoEx: DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+                {
+                    int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    if (error is not (87 or 50 or 1)) throw new Win32Exception(error);
+                    if (!Native.SetFileInformationByHandle(h, 4, BitConverter.GetBytes(1), 4)) throw new Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+                }
                 h.Dispose(); deleted++; removedLinks[identity] = removed + 1; if (i.Links == 1) estimated += f.Allocated;
                 Record(new { state = "deleted", path = f.Path });
                 if (deleted % 32 == 0 || deleted == p.Files.Length) progress?.Invoke(new("deleting", deleted, p.Files.Length, deleted));

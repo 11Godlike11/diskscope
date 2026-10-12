@@ -10,7 +10,9 @@ Execution permanently deletes files and bypasses the Recycle Bin. There is no ro
 
 The preview stores explicit selected paths and an exact file set with volume serial number, file ID, logical size, allocation, modification time, and link count. It expires after one hour. New files are not added at execution time; directories remain.
 
-Execution performs a full preflight, then checks each file again using the same open handle used to mark deletion. Ancestors are opened without delete sharing to pin their path, and reparse points are refused. The file handle denies write and delete sharing while validating and deleting. This is intended to prevent ordinary rename/replacement races through that path.
+Execution performs a full preflight, then checks each file again using the same open handle used to mark deletion. Ancestors are opened with directory-list/read-attributes access and read/write sharing, without delete sharing, to block rename/delete; reparse points are refused. Preview and deletion both resolve the file handle's final DOS path, recheck protected-path rules, and require it to match the expected path (case-insensitive, ignoring the extended-path prefix). The file handle denies write and delete sharing while validating and deleting. This is intended to prevent ordinary rename/replacement races through that path.
+
+Deletion prefers `FileDispositionInfoEx` with delete, POSIX semantics, and ignore-readonly flags, allowing read-only files to be deleted without changing their attributes. If Windows reports invalid parameter, not supported, or invalid function, execution falls back to `FileDispositionInfo`; read-only files can still fail on that legacy path.
 
 An exclusive audit-file creation prevents the same plan from executing twice, including across processes. Every delete intent and completed deletion is flushed to a local audit log. Execution stops on its first file error. After interruption, an intent without completion can have an uncertain outcome: inspect current paths and create a new plan for remaining authorized files rather than replaying the old one.
 
@@ -29,7 +31,7 @@ Cleanup also refuses alternate-stream selections and UNC paths. The tool does no
 - Directory live metadata describes the directory itself, not a recursive sum.
 - NTFS metadata appears in scans; its presence is not a recommendation to delete it.
 
-The scan is taken on an active volume and is not a VSS consistent snapshot or a real-time USN monitor. Concurrent file changes can affect the result. Rescan after meaningful changes and use live metadata before cleanup.
+MFT update-sequence repair uses fixed 512-byte boundaries, including on volumes with 4096-byte native sectors. The scan is taken on an active volume and is not a VSS consistent snapshot or a real-time USN monitor. Concurrent file changes can affect the result. Rescan after meaningful changes and use live metadata before cleanup.
 
 ## Privacy and memory
 

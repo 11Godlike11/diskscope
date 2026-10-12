@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace DiskScope;
@@ -20,6 +21,8 @@ static class Native
     public static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int type, byte[] info, int size);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool SetFileInformationByHandle(SafeFileHandle handle, int type, byte[] info, int size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
     [StructLayout(LayoutKind.Sequential)]
     public struct FileInfoNative
     {
@@ -62,6 +65,21 @@ static class Native
         var b = new byte[24];
         if (!GetFileInformationByHandleEx(h, 1, b, b.Length)) throw new Win32Exception(Marshal.GetLastWin32Error());
         return BitConverter.ToInt64(b, 0);
+    }
+    public static string FinalPath(SafeFileHandle h)
+    {
+        var path = new StringBuilder(512);
+        while (true)
+        {
+            uint n = GetFinalPathNameByHandleW(h, path, (uint)path.Capacity, 0); // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+            if (n == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (n < path.Capacity)
+            {
+                string result = path.ToString();
+                return result.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ? @"\\" + result[8..] : result.StartsWith(@"\\?\") ? result[4..] : result;
+            }
+            path = new StringBuilder(checked((int)n));
+        }
     }
     public static string LongPath(string p) => p.StartsWith(@"\\?\") ? p : @"\\?\" + p;
 }
